@@ -2,17 +2,17 @@ package com.sanhaengii.wearhealthsender
 
 import android.Manifest
 import android.app.Activity
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.IBinder
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
@@ -23,16 +23,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Space
 import android.widget.TextView
-import androidx.health.services.client.ExerciseUpdateCallback
-import androidx.health.services.client.HealthServices
-import androidx.health.services.client.data.Availability
-import androidx.health.services.client.data.DataPointContainer
-import androidx.health.services.client.data.DataType
-import androidx.health.services.client.data.ExerciseConfig
-import androidx.health.services.client.data.ExerciseEvent
-import androidx.health.services.client.data.ExerciseLapSummary
-import androidx.health.services.client.data.ExerciseType
-import androidx.health.services.client.data.ExerciseUpdate
+import androidx.core.content.ContextCompat
 import com.google.android.gms.wearable.DataClient
 import com.google.android.gms.wearable.MessageClient
 import com.google.android.gms.wearable.MessageEvent
@@ -40,117 +31,23 @@ import com.google.android.gms.wearable.PutDataMapRequest
 import com.google.android.gms.wearable.Wearable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.guava.await
 import kotlinx.coroutines.launch
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 import java.time.OffsetDateTime
 import java.time.ZoneId
 import java.time.temporal.ChronoUnit
 import kotlin.math.roundToInt
 
-data class HealthServicesPayload(
-    val measuredAt: String,
-    val heartRate: Int?,
-    val steps: Int?,
-    val calories: Double?,
-    val spo2: Double?,
-    val bodyTemp: Double?,
-    val bloodPressureSystolic: Int?,
-    val bloodPressureDiastolic: Int?,
-) {
-    fun toJson(userId: Long): JSONObject {
-        return JSONObject()
-            .put("user_id", userId)
-            .put("measured_at", measuredAt)
-            .putNullable("heart_rate", heartRate)
-            .putNullable("steps", steps)
-            .putNullable("calories", calories)
-            .putNullable("spo2", spo2)
-            .putNullable("body_temp", bodyTemp)
-            .putNullable("blood_pressure_systolic", bloodPressureSystolic)
-            .putNullable("blood_pressure_diastolic", bloodPressureDiastolic)
-    }
-
-    fun toRequestBody(userId: Long): String {
-        return toJson(userId).toString()
-    }
-
-    fun toDisplayText(): String {
-        return """
-            HR: ${heartRate.display("bpm")}
-            BP: ${displayBloodPressure()}
-            SpO2: ${spo2.display("%")}
-            Steps: ${steps.display()}
-            Calories: ${calories.display("kcal")}
-            Temp: ${bodyTemp.display("C")}
-            At: $measuredAt
-        """.trimIndent()
-    }
-
-    fun mergeWith(update: HealthServicesPayload): HealthServicesPayload {
-        return copy(
-            measuredAt = update.measuredAt,
-            heartRate = update.heartRate ?: heartRate,
-            steps = maxNullable(steps, update.steps),
-            calories = maxNullable(calories, update.calories),
-            spo2 = update.spo2 ?: spo2,
-            bodyTemp = update.bodyTemp ?: bodyTemp,
-            bloodPressureSystolic = update.bloodPressureSystolic ?: bloodPressureSystolic,
-            bloodPressureDiastolic = update.bloodPressureDiastolic ?: bloodPressureDiastolic,
-        )
-    }
-
-    fun hasCollectedRequiredValues(): Boolean {
-        return steps != null && calories != null
-    }
-
-    fun missingRequiredFields(): String {
-        return listOfNotNull(
-            "steps".takeIf { steps == null },
-            "calories".takeIf { calories == null },
-        ).joinToString()
-    }
-
-    private fun displayBloodPressure(): String {
-        return if (bloodPressureSystolic == null || bloodPressureDiastolic == null) {
-            "-"
-        } else {
-            "$bloodPressureSystolic/$bloodPressureDiastolic mmHg"
-        }
-    }
-
-    companion object {
-        fun empty(): HealthServicesPayload {
-            return HealthServicesPayload(
-                measuredAt = nowKstIsoString(),
-                heartRate = null,
-                steps = null,
-                calories = null,
-                spo2 = null,
-                bodyTemp = null,
-                bloodPressureSystolic = null,
-                bloodPressureDiastolic = null,
-            )
-        }
-    }
-}
-
-private fun maxNullable(first: Int?, second: Int?): Int? {
-    return listOfNotNull(first, second).maxOrNull()
-}
-
-private fun maxNullable(first: Double?, second: Double?): Double? {
-    return listOfNotNull(first, second).maxOrNull()
-}
-
 class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val exerciseClient by lazy { HealthServices.getClient(this).exerciseClient }
+    private val credentialStore by lazy { SecureCredentialStore(this) }
+    private var trackingService: HealthTrackingService? = null
+    private var trackingStateJob: Job? = null
+    private var isTrackingServiceBound = false
 
     private lateinit var baseUrlInput: EditText
     private lateinit var tokenInput: EditText
@@ -177,100 +74,38 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
     private var isPeriodicSendingEnabled = false
     private var sendOnNextUpdate = false
     private var pendingPermissionAction = PendingPermissionAction.NONE
-    private var nextFakeSpo2 = 100
-    private var lastSpo2: Double? = null
-    private var lastHeartRate: Int? = null
-    private var isFakeSpo2Active = false
-    private var spo2SourceText = "initializing"
-    private var samsungSpo2Provider: SamsungSpo2Provider? = null
-    private var supportedDataTypes = DEFAULT_DATA_TYPES
-    private var stepCounterBaseline: Float? = null
-    private var fallbackSteps = 0
-    private val sensorManager by lazy { getSystemService(SensorManager::class.java) }
-    private val stepCounterSensor by lazy { sensorManager?.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) }
-    private val stepCounterListener = object : SensorEventListener {
-        override fun onSensorChanged(event: SensorEvent) {
-            val totalSteps = event.values.firstOrNull() ?: return
-            val baseline = stepCounterBaseline
-            if (baseline == null) {
-                stepCounterBaseline = totalSteps
-                fallbackSteps = 0
-            } else {
-                fallbackSteps = (totalSteps - baseline).toInt().coerceAtLeast(0)
-            }
+    private var spo2SourceText = "service 연결 중"
 
-            val stableSteps = maxOf(currentPayload.steps ?: 0, fallbackSteps)
-            currentPayload = currentPayload.copy(
-                measuredAt = nowKstIsoString(),
-                steps = stableSteps,
-                calories = stableCalories(null, stableSteps),
-            )
-            renderPayload()
-        }
-
-        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
-    }
-
-    private val fakeSpo2Runnable = object : Runnable {
-        override fun run() {
-            updateFakeSpo2()
-            mainHandler.postDelayed(this, SPO2_TICK_MS)
-        }
-    }
-
-    private val periodicHealthSendRunnable = object : Runnable {
-        override fun run() {
-            if (!isHikingActive || !isPeriodicSendingEnabled) {
-                return
-            }
-            sendCollectedPayload(requireHiking = true)
-            mainHandler.postDelayed(this, HEALTH_SEND_INTERVAL_MS)
-        }
-    }
-
-    private val exerciseUpdateCallback = object : ExerciseUpdateCallback {
-        override fun onExerciseUpdateReceived(update: ExerciseUpdate) {
-            val payload = payloadFromMetrics(update.latestMetrics)
-            mainHandler.post {
-                currentPayload = currentPayload.mergeWith(payload)
-                renderPayload()
-                appendResult("Health Services update received.")
-                
-                syncDataToWatch()
-
-                if (sendOnNextUpdate) {
-                    val sent = sendCollectedPayload(requireHiking = true)
-                    if (sendOnNextUpdate && sent) {
+    private val trackingServiceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+            val service = (binder as? HealthTrackingService.LocalBinder)?.service ?: return
+            trackingService = service
+            isTrackingServiceBound = true
+            trackingStateJob?.cancel()
+            trackingStateJob = activityScope.launch {
+                service.state.collect { tracking ->
+                    val previousPayload = currentPayload
+                    currentPayload = tracking.payload
+                    isExerciseRunning = tracking.isActive
+                    isHikingActive = tracking.isActive
+                    isPeriodicSendingEnabled = tracking.isActive && !tracking.isPaused
+                    spo2SourceText = tracking.sensorStatus
+                    updateExerciseButtons()
+                    updateAutoSendButton()
+                    renderPayload()
+                    if (tracking.payload != previousPayload) syncDataToWatch()
+                    if (sendOnNextUpdate && tracking.payload.hasCollectedRequiredValues()) {
                         sendOnNextUpdate = false
+                        sendCollectedPayload(requireHiking = true)
                     }
                 }
             }
         }
 
-        override fun onAvailabilityChanged(dataType: DataType<*, *>, availability: Availability) {
-            mainHandler.post {
-                appendResult("${dataType.name} availability: ${availability::class.simpleName}")
-            }
-        }
-
-        override fun onExerciseEventReceived(event: ExerciseEvent) {
-            mainHandler.post {
-                appendResult("Exercise event: ${event::class.simpleName}")
-            }
-        }
-
-        override fun onLapSummaryReceived(lapSummary: ExerciseLapSummary) = Unit
-
-        override fun onRegistered() {
-            mainHandler.post {
-                appendResult("Health Services callback registered.")
-            }
-        }
-
-        override fun onRegistrationFailed(throwable: Throwable) {
-            mainHandler.post {
-                appendResult("Health Services callback registration failed: ${throwable.message ?: throwable.javaClass.simpleName}")
-            }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            trackingStateJob?.cancel()
+            trackingService = null
+            isTrackingServiceBound = false
         }
     }
 
@@ -279,20 +114,19 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         setContentView(createContentView())
         renderPayload()
         updateExerciseButtons()
-        refreshCapabilities()
-        startSpo2Provider()
-        
+        bindService(
+            Intent(this, HealthTrackingService::class.java),
+            trackingServiceConnection,
+            Context.BIND_AUTO_CREATE,
+        )
         Wearable.getMessageClient(this).addListener(this)
     }
 
     override fun onDestroy() {
-        mainHandler.removeCallbacks(fakeSpo2Runnable)
-        mainHandler.removeCallbacks(periodicHealthSendRunnable)
-        samsungSpo2Provider?.stop()
-        stopStepCounterFallback()
-        if (isExerciseRunning) {
-            exerciseClient.clearUpdateCallbackAsync(exerciseUpdateCallback)
-            exerciseClient.endExerciseAsync()
+        trackingStateJob?.cancel()
+        if (isTrackingServiceBound) {
+            unbindService(trackingServiceConnection)
+            isTrackingServiceBound = false
         }
         Wearable.getMessageClient(this).removeListener(this)
         activityScope.cancel()
@@ -374,13 +208,15 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         root.addView(baseUrlInput)
 
         root.addSpace(8)
-        root.addView(label("JWT token"))
-        tokenInput = input(BuildConfig.HEALTH_API_TOKEN)
+        root.addView(label("JWT credential"))
+        tokenInput = input(credentialStore.load()?.token?.let { "저장됨 ···${it.takeLast(6)}" }.orEmpty()).apply {
+            isEnabled = false
+        }
         root.addView(tokenInput)
 
         root.addSpace(8)
         root.addView(label("User ID"))
-        userIdInput = input(BuildConfig.HEALTH_API_USER_ID)
+        userIdInput = input(credentialStore.load()?.userId?.toString().orEmpty())
         root.addView(userIdInput)
 
         root.addSpace(12)
@@ -487,26 +323,6 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         }
     }
 
-    private fun refreshCapabilities() {
-        activityScope.launch {
-            val result = runCatching {
-                val capabilities = exerciseClient.getCapabilitiesAsync().await()
-                if (ExerciseType.WALKING in capabilities.supportedExerciseTypes) {
-                    capabilities.getExerciseTypeCapabilities(ExerciseType.WALKING).supportedDataTypes
-                } else {
-                    emptySet()
-                }
-            }
-
-            result
-                .onSuccess { capabilities ->
-                    supportedDataTypes = DEFAULT_DATA_TYPES.filterTo(mutableSetOf()) { it in capabilities }
-                    appendResult("Supported HS data: ${supportedDataTypes.joinToString { it.name }}")
-                }
-                .onFailure { appendResult("Could not read Health Services capabilities: ${it.message ?: it.javaClass.simpleName}") }
-        }
-    }
-
     private fun startExercise() {
         if (!hasRequiredPermissions()) {
             pendingPermissionAction = PendingPermissionAction.START_EXERCISE
@@ -519,40 +335,11 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             return
         }
 
-        activityScope.launch {
-            val result = runCatching {
-                exerciseClient.setUpdateCallback(exerciseUpdateCallback)
-                exerciseClient.startExerciseAsync(
-                    ExerciseConfig(
-                        exerciseType = ExerciseType.WALKING,
-                        dataTypes = supportedDataTypes,
-                        isAutoPauseAndResumeEnabled = false,
-                        isGpsEnabled = false,
-                    ),
-                ).await()
-            }
-
-            result
-                .onSuccess {
-                    isExerciseRunning = true
-                    isHikingActive = true
-                    currentPayload = HealthServicesPayload.empty().copy(
-                        heartRate = lastHeartRate,
-                        spo2 = lastSpo2,
-                        steps = 0,
-                        bodyTemp = DEFAULT_BODY_TEMP,
-                    )
-                    startStepCounterFallback()
-                    startPeriodicSending()
-                    updateExerciseButtons()
-                    renderPayload()
-                    appendResult("Started hiking. Health data will POST every 3 seconds.")
-                }
-                .onFailure {
-                    appendResult("Could not start Health Services exercise: ${it.message ?: it.javaClass.simpleName}")
-                    sendOnNextUpdate = false
-                }
-        }
+        ContextCompat.startForegroundService(
+            this,
+            Intent(this, HealthTrackingService::class.java).setAction(HealthTrackingService.ACTION_START),
+        )
+        appendResult("Foreground service starting. Health data will POST every 3 seconds.")
     }
 
     private fun stopExercise() {
@@ -561,110 +348,9 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             return
         }
 
-        activityScope.launch {
-            val result = runCatching {
-                exerciseClient.clearUpdateCallbackAsync(exerciseUpdateCallback).await()
-                exerciseClient.endExerciseAsync().await()
-            }
-
-            result
-                .onSuccess {
-                    isExerciseRunning = false
-                    isHikingActive = false
-                    sendOnNextUpdate = false
-                    stopStepCounterFallback()
-                    stopPeriodicSending()
-                    updateExerciseButtons()
-                    appendResult("Stopped hiking and 3-second health data sending.")
-                }
-                .onFailure { appendResult("Could not stop Health Services exercise: ${it.message ?: it.javaClass.simpleName}") }
-        }
-    }
-
-    private fun startStepCounterFallback() {
-        fallbackSteps = 0
-        stepCounterBaseline = null
-        currentPayload = currentPayload.copy(steps = currentPayload.steps ?: 0)
-        val sensor = stepCounterSensor
-        if (sensor == null) {
-            appendResult("Step counter sensor is unavailable; using Health Services steps only.")
-            return
-        }
-
-        sensorManager?.registerListener(stepCounterListener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
-        appendResult("Step counter fallback started.")
-    }
-
-    private fun stopStepCounterFallback() {
-        sensorManager?.unregisterListener(stepCounterListener)
-        stepCounterBaseline = null
-        fallbackSteps = 0
-    }
-
-    private fun payloadFromMetrics(metrics: DataPointContainer): HealthServicesPayload {
-        val heartRate = metrics.getData(DataType.HEART_RATE_BPM)
-            .lastOrNull()
-            ?.value
-            ?.roundToInt()
-        if (heartRate != null) {
-            lastHeartRate = heartRate
-        }
-
-        val healthServicesSteps = metrics.getData(DataType.STEPS_TOTAL)
-            ?.total
-            ?.toInt()
-        val steps = maxOf(currentPayload.steps ?: 0, fallbackSteps, healthServicesSteps ?: 0)
-
-        val healthServicesCalories = metrics.getData(DataType.CALORIES_TOTAL)
-            ?.total
-            ?.roundToOneDecimal()
-        val calories = stableCalories(healthServicesCalories, steps)
-
-        return HealthServicesPayload(
-            measuredAt = nowKstIsoString(),
-            heartRate = heartRate ?: currentPayload.heartRate ?: lastHeartRate,
-            steps = steps,
-            calories = calories,
-            spo2 = lastSpo2,
-            bodyTemp = currentPayload.bodyTemp ?: DEFAULT_BODY_TEMP,
-            bloodPressureSystolic = null,
-            bloodPressureDiastolic = null,
-        )
-    }
-
-    private fun stableCalories(healthServicesCalories: Double?, steps: Int): Double? {
-        return listOfNotNull(
-            currentPayload.calories,
-            healthServicesCalories,
-            estimateCaloriesFromSteps(steps).takeIf { steps > 0 },
-        ).maxOrNull()?.roundToOneDecimal()
-    }
-
-    private fun estimateCaloriesFromSteps(steps: Int): Double {
-        return (steps * CALORIES_PER_STEP).roundToOneDecimal()
-    }
-
-    private fun startSpo2Provider() {
-        appendResult("SpO2 provider: trying Samsung Health Sensor SDK.")
-        val provider = SamsungSpo2Provider(
-            context = this,
-            mainHandler = mainHandler,
-            onReading = ::handleSamsungSpo2Reading,
-            onStatus = ::appendResult,
-            onFallbackNeeded = ::handleSamsungSpo2Unavailable,
-        )
-        samsungSpo2Provider = provider
-        if (provider.start()) {
-            isFakeSpo2Active = false
-            spo2SourceText = "Samsung Health Sensor SDK"
-            updateSpo2Button()
-            renderPayload()
-        } else {
-            samsungSpo2Provider = null
-            spo2SourceText = "unavailable"
-            updateSpo2Button()
-            appendResult("Samsung SpO2 provider could not start. Continuing without SpO2.")
-        }
+        startService(Intent(this, HealthTrackingService::class.java).setAction(HealthTrackingService.ACTION_STOP))
+        sendOnNextUpdate = false
+        appendResult("Foreground service stop requested.")
     }
 
     private fun requestSpo2Measurement() {
@@ -674,78 +360,11 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
             return
         }
 
-        if (isFakeSpo2Active) {
-            updateFakeSpo2()
-            appendResult("Fake SpO2 fallback updated.")
-            return
-        }
-
-        val provider = samsungSpo2Provider
-        if (provider == null) {
-            appendResult("Samsung SpO2 provider is not available. Continuing without SpO2.")
+        if (trackingService?.requestSpo2Measurement() == true) {
+            appendResult("Samsung SpO2 measurement requested through foreground service.")
         } else {
-            provider.requestMeasurement()
+            appendResult("SpO2 provider is not ready or unavailable.")
         }
-    }
-
-    private fun handleSamsungSpo2Reading(spo2: Double, heartRate: Int?) {
-        val stableHeartRate = heartRate ?: currentPayload.heartRate ?: lastHeartRate
-        if (heartRate != null) {
-            lastHeartRate = heartRate
-        }
-        lastSpo2 = spo2
-        spo2SourceText = "Samsung Health Sensor SDK"
-        currentPayload = currentPayload.copy(
-            measuredAt = nowKstIsoString(),
-            heartRate = stableHeartRate,
-            spo2 = spo2,
-        )
-        renderPayload()
-        appendResult("Samsung SpO2 measured: ${spo2.roundToInt()}%.")
-    }
-
-    private fun handleSamsungSpo2Unavailable(reason: String) {
-        val previousSpo2 = lastSpo2
-        if (previousSpo2 == null) {
-            appendResult("$reason No previous SpO2 yet; sending without SpO2 until a measurement succeeds.")
-            return
-        }
-
-        currentPayload = currentPayload.copy(spo2 = previousSpo2)
-        renderPayload()
-        appendResult("$reason Keeping previous SpO2=${previousSpo2.roundToInt()}%.")
-    }
-
-    private fun activateFakeSpo2Fallback(reason: String) {
-        if (isFakeSpo2Active) {
-            appendResult(reason)
-            return
-        }
-
-        samsungSpo2Provider?.stop()
-        samsungSpo2Provider = null
-        isFakeSpo2Active = true
-        spo2SourceText = "fake fallback"
-        updateSpo2Button()
-        appendResult("$reason Using fake SpO2 fallback.")
-        updateFakeSpo2()
-        mainHandler.postDelayed(fakeSpo2Runnable, SPO2_TICK_MS)
-    }
-
-    private fun updateFakeSpo2() {
-        val spo2 = nextFakeSpo2.toDouble()
-        lastSpo2 = spo2
-        nextFakeSpo2 = if (nextFakeSpo2 <= MIN_FAKE_SPO2) {
-            MAX_FAKE_SPO2
-        } else {
-            nextFakeSpo2 - 1
-        }
-
-        currentPayload = currentPayload.copy(
-            measuredAt = nowKstIsoString(),
-            spo2 = lastSpo2,
-        )
-        renderPayload()
     }
 
     private fun sendCollectedPayload(requireHiking: Boolean): Boolean {
@@ -773,7 +392,7 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
 
     private fun sendCurrentPayload() {
         val baseUrl = baseUrlInput.text.toString().trim().trimEnd('/')
-        val token = tokenInput.text.toString().trim()
+        val token = credentialStore.load()?.token.orEmpty()
         val userId = userIdInput.text.toString().trim().toLongOrNull()
 
         if (baseUrl.isBlank()) {
@@ -792,12 +411,16 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         currentPayload = payloadForSend
         renderPayload()
 
-        val requestBody = payloadForSend.toRequestBody(userId)
         appendResult("POST $baseUrl/health/data")
 
         Thread {
             val result = runCatching {
-                postHealthData(baseUrl, token, requestBody)
+                val response = HealthDataRepository(
+                    apiBaseUrl = baseUrl,
+                    relayBaseUrl = "",
+                    allowCleartext = BuildConfig.DEBUG,
+                ).postHealthData(payloadForSend, userId, token)
+                "HTTP ${response.code}\n${response.body}"
             }
 
             mainHandler.post {
@@ -810,49 +433,10 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
     }
 
     private fun stablePayloadForSend(): HealthServicesPayload {
-        val stableSteps = maxOf(currentPayload.steps ?: 0, fallbackSteps)
         return currentPayload.copy(
             measuredAt = nowKstIsoString(),
-            heartRate = currentPayload.heartRate ?: lastHeartRate,
-            steps = stableSteps,
-            calories = stableCalories(null, stableSteps),
-            bodyTemp = currentPayload.bodyTemp ?: DEFAULT_BODY_TEMP,
+            bodyTemp = null,
         )
-    }
-
-    private fun postHealthData(baseUrl: String, token: String, body: String): String {
-        val connection = URL("$baseUrl/health/data").openConnection() as HttpURLConnection
-        return try {
-            connection.requestMethod = "POST"
-            connection.connectTimeout = 15_000
-            connection.readTimeout = 15_000
-            connection.doOutput = true
-            connection.setRequestProperty("Accept", "application/json")
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            if (token.isNotBlank()) {
-                connection.setRequestProperty("Authorization", "Bearer $token")
-            }
-
-            connection.outputStream.use { output ->
-                output.write(body.toByteArray(Charsets.UTF_8))
-            }
-
-            val code = connection.responseCode
-            val responseBody = readResponseBody(connection)
-            "HTTP $code\n$responseBody"
-        } finally {
-            connection.disconnect()
-        }
-    }
-
-    private fun readResponseBody(connection: HttpURLConnection): String {
-        val stream = if (connection.responseCode in 200..299) {
-            connection.inputStream
-        } else {
-            connection.errorStream
-        }
-
-        return stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
     }
 
     private fun renderPayload() {
@@ -882,11 +466,7 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         if (!::measureSpo2Button.isInitialized) {
             return
         }
-        measureSpo2Button.text = if (isFakeSpo2Active) {
-            "Fake SpO2 next"
-        } else {
-            "Measure SpO2"
-        }
+        measureSpo2Button.text = "Measure SpO2"
     }
 
     private fun togglePeriodicSending() {
@@ -897,9 +477,9 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         }
 
         if (isPeriodicSendingEnabled) {
-            stopPeriodicSending()
+            startService(Intent(this, HealthTrackingService::class.java).setAction(HealthTrackingService.ACTION_PAUSE))
         } else {
-            startPeriodicSending()
+            startService(Intent(this, HealthTrackingService::class.java).setAction(HealthTrackingService.ACTION_RESUME))
         }
     }
 
@@ -912,25 +492,6 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         autoSendButton.setBackgroundColor(
             if (isPeriodicSendingEnabled) Color.rgb(251, 146, 60) else Color.rgb(148, 163, 184),
         )
-    }
-
-    private fun startPeriodicSending() {
-        if (!isHikingActive) {
-            return
-        }
-
-        isPeriodicSendingEnabled = true
-        mainHandler.removeCallbacks(periodicHealthSendRunnable)
-        mainHandler.postDelayed(periodicHealthSendRunnable, HEALTH_SEND_INTERVAL_MS)
-        updateAutoSendButton()
-        renderPayload()
-    }
-
-    private fun stopPeriodicSending() {
-        isPeriodicSendingEnabled = false
-        mainHandler.removeCallbacks(periodicHealthSendRunnable)
-        updateAutoSendButton()
-        renderPayload()
     }
 
     private fun appendResult(message: String) {
@@ -1048,18 +609,6 @@ class MainActivity : Activity(), MessageClient.OnMessageReceivedListener {
         private const val PERMISSION_READ_HEART_RATE = "android.permission.health.READ_HEART_RATE"
         private const val PERMISSION_READ_OXYGEN_SATURATION =
             "android.permission.health.READ_OXYGEN_SATURATION"
-        private const val SPO2_TICK_MS = 1_000L
-        private const val HEALTH_SEND_INTERVAL_MS = 3_000L
-        private const val DEFAULT_BODY_TEMP = 36.7
-        private const val CALORIES_PER_STEP = 0.04
-        private const val MAX_FAKE_SPO2 = 100
-        private const val MIN_FAKE_SPO2 = 90
-
-        private val DEFAULT_DATA_TYPES = setOf(
-            DataType.HEART_RATE_BPM,
-            DataType.STEPS_TOTAL,
-            DataType.CALORIES_TOTAL,
-        )
     }
 }
 
@@ -1071,31 +620,9 @@ private enum class PendingPermissionAction {
 
 private val KST_ZONE: ZoneId = ZoneId.of("Asia/Seoul")
 
-private fun nowKstIsoString(): String {
-    return OffsetDateTime.now(KST_ZONE)
-        .truncatedTo(ChronoUnit.SECONDS)
-        .toString()
-}
-
 private fun nowKstTimeText(): String {
     return OffsetDateTime.now(KST_ZONE)
         .toLocalTime()
         .truncatedTo(ChronoUnit.SECONDS)
         .toString()
-}
-
-private fun JSONObject.putNullable(key: String, value: Any?): JSONObject {
-    return put(key, value ?: JSONObject.NULL)
-}
-
-private fun Int?.display(suffix: String = ""): String {
-    return this?.let { if (suffix.isBlank()) "$it" else "$it $suffix" } ?: "-"
-}
-
-private fun Double?.display(suffix: String = ""): String {
-    return this?.let { if (suffix.isBlank()) "$it" else "$it $suffix" } ?: "-"
-}
-
-private fun Double.roundToOneDecimal(): Double {
-    return (this * 10.0).roundToInt() / 10.0
 }

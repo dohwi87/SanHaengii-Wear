@@ -20,8 +20,6 @@ val healthApiBaseUrl = localProperties.getProperty(
     "HEALTH_API_BASE_URL",
     "https://web-production-94f63.up.railway.app"
 )
-val healthApiToken = localProperties.getProperty("HEALTH_API_TOKEN", "")
-val healthApiUserId = localProperties.getProperty("HEALTH_API_USER_ID", "")
 // 로컬 Flask 서버 (에뮬레이터: 10.0.2.2, 실기기: 호스트 PC IP)
 val trailApiBaseUrl = localProperties.getProperty("TRAIL_API_BASE_URL", "http://10.0.2.2:5001")
 
@@ -37,8 +35,6 @@ android {
         versionName = "0.1.0"
 
         buildConfigField("String", "HEALTH_API_BASE_URL", healthApiBaseUrl.asBuildConfigString())
-        buildConfigField("String", "HEALTH_API_TOKEN", healthApiToken.asBuildConfigString())
-        buildConfigField("String", "HEALTH_API_USER_ID", healthApiUserId.asBuildConfigString())
         buildConfigField("String", "TRAIL_API_BASE_URL", trailApiBaseUrl.asBuildConfigString())
     }
 
@@ -74,6 +70,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
 
     // 기본 Compose
+    implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.activity:activity-compose:1.8.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.compose.ui:ui:1.6.1")
