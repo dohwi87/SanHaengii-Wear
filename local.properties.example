@@ -1,6 +1,5 @@
-## Copy this file to local.properties and fill in your real token if needed.
+## Copy this file to local.properties and configure only environment-specific URLs.
 ## Do not commit local.properties.
 
 HEALTH_API_BASE_URL=https://web-production-94f63.up.railway.app
-HEALTH_API_TOKEN=
-HEALTH_API_USER_ID=
+TRAIL_API_BASE_URL=http://10.0.2.2:5001

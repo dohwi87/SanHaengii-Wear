@@ -7,27 +7,35 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 
 class MainViewModel : ViewModel() {
+    private val emergencyMachine = EmergencyStateMachine()
+
     var bpm by mutableIntStateOf(0)
     var eta by mutableStateOf("-")
     var distance by mutableStateOf("-")
     var isPaused by mutableStateOf(false)
     var isHikingActive by mutableStateOf(false)
-    var isSosReporting by mutableStateOf(false)
+    var emergencyState by mutableStateOf(emergencyMachine.state)
+        private set
 
-    // 생체 이상 감지 상태
-    var isAnomalyDetected by mutableStateOf(false)
-    var anomalyMessage by mutableStateOf("")
-    var anomalyCountdown by mutableStateOf<Int?>(null)
-    var anomalySosRequestId by mutableStateOf<Int?>(null)
-    // 모바일 앱에서 감지된 이상징후 여부 (UI에서 "괜찮아요" 레이블 표시용)
-    var isMobileAnomalySource by mutableStateOf(false)
+    val isEmergencyVisible: Boolean
+        get() = emergencyState.phase != EmergencyPhase.IDLE
 
-    // 신고 전송 진행 상태 ("idle" / "sending" / "success" / "failed")
-    var emergencySendState by mutableStateOf("idle")
+    val anomalyMessage: String
+        get() = emergencyState.alert?.message.orEmpty()
 
-    fun resetSosReporting() {
-        isSosReporting = false
-    }
+    val anomalyCountdown: Int?
+        get() = emergencyState.countdownSeconds
+
+    val isMobileAnomalySource: Boolean
+        get() = emergencyState.alert?.source == EmergencySource.MOBILE_SYNC
+
+    val emergencySendState: String
+        get() = when (emergencyState.phase) {
+            EmergencyPhase.IDLE, EmergencyPhase.COUNTDOWN -> "idle"
+            EmergencyPhase.SENDING -> "sending"
+            EmergencyPhase.SUCCESS -> "success"
+            EmergencyPhase.FAILED -> "failed"
+        }
 
     fun updateHeartRate(newBpm: Int) {
         bpm = newBpm
@@ -54,32 +62,48 @@ class MainViewModel : ViewModel() {
         if (!active) isPaused = false
     }
 
-    fun triggerAnomaly(message: String, sosRequestId: Int? = null) {
-        isAnomalyDetected = true
-        anomalyMessage = message
-        anomalyCountdown = 30
-        anomalySosRequestId = sosRequestId
+    fun startEmergencyAlert(alert: EmergencyAlert, countdownSeconds: Int = 30): Boolean {
+        val started = emergencyMachine.startAlert(alert, countdownSeconds)
+        syncEmergencyState()
+        return started
     }
 
-    // 카운트다운 1초 감소. 정확히 1→0이 될 때만 true 반환 (이미 0이면 false로 중복 방지)
     fun tickCountdown(): Boolean {
-        val current = anomalyCountdown ?: return false
-        if (current <= 0) return false
-        return if (current == 1) {
-            anomalyCountdown = 0
-            true
-        } else {
-            anomalyCountdown = current - 1
-            false
-        }
+        val finished = emergencyMachine.tickCountdown()
+        syncEmergencyState()
+        return finished
     }
 
-    fun resetAnomaly() {
-        isAnomalyDetected = false
-        anomalyMessage = ""
-        anomalyCountdown = null
-        anomalySosRequestId = null
-        isMobileAnomalySource = false
-        emergencySendState = "idle"
+    fun beginEmergencySend(trigger: EmergencyTrigger): EmergencyAlert? {
+        val alert = emergencyMachine.beginSending(trigger)
+        syncEmergencyState()
+        return alert
+    }
+
+    fun markEmergencySucceeded(): Boolean {
+        val changed = emergencyMachine.markSucceeded()
+        syncEmergencyState()
+        return changed
+    }
+
+    fun markEmergencyFailed(message: String? = null): Boolean {
+        val changed = emergencyMachine.markFailed(message)
+        syncEmergencyState()
+        return changed
+    }
+
+    fun cancelEmergency(): EmergencyAlert? {
+        val alert = emergencyMachine.cancel()
+        syncEmergencyState()
+        return alert
+    }
+
+    fun resetEmergency() {
+        emergencyMachine.reset()
+        syncEmergencyState()
+    }
+
+    private fun syncEmergencyState() {
+        emergencyState = emergencyMachine.state
     }
 }

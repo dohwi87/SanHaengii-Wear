@@ -9,7 +9,7 @@ SanHaengii의 실제 센서 연동 전 검증을 위한 Wear OS 테스트 앱입
 - Wear Compose 대시보드와 기존 Android View 기반 백엔드 테스트 화면
 - Wear OS Health Services SDK 사용
 - Galaxy Watch에서는 Samsung Health Sensor SDK를 통해 실제 SpO2 측정 시도
-- 외부 HTTP 라이브러리 미사용, `HttpURLConnection`으로 POST 전송
+- foreground service가 센서 수집·주기 전송을 담당하고 repository가 HTTP 요청·응답 파싱을 담당
 - 기본 서버: `https://web-production-94f63.up.railway.app`
 - endpoint: `POST /health/data`
 
@@ -29,7 +29,7 @@ SanHaengii의 실제 센서 연동 전 검증을 위한 Wear OS 테스트 앱입
 }
 ```
 
-Health Services 에뮬레이터 synthetic data는 심박수와 걸음 관련 값 중심으로 테스트할 수 있습니다. SpO2는 Galaxy Watch 실기기에서 Samsung Health Sensor SDK의 `SPO2_ON_DEMAND` 측정을 먼저 시도합니다. Samsung SDK가 앱에 포함되어 있지 않거나, 에뮬레이터/미지원 기기/측정 실패 상황이면 fake fallback으로 전환됩니다. fake SpO2는 100에서 시작해 1초마다 1씩 감소하고, 90 다음에는 다시 100으로 돌아가 반복됩니다. 체온은 Samsung Health Sensor SDK의 skin temperature tracker를 먼저 시도합니다. Galaxy Watch의 온도 센서 값은 core body temperature가 아니라 피부/접촉 온도에 가까우며, 값을 받지 못하면 `36.7` fallback 값을 전송합니다. 혈압은 현재 앱에서는 `null`로 보냅니다.
+Health Services 에뮬레이터 synthetic data는 심박수와 걸음 관련 값 중심으로 테스트할 수 있습니다. SpO2는 Galaxy Watch 실기기에서 Samsung Health Sensor SDK의 `SPO2_ON_DEMAND` 실측값만 사용합니다. 측정에 실패하면 최근 15분 이내의 실측값만 재사용하고, 그보다 오래됐거나 측정 이력이 없으면 `null`을 전송합니다. 현재 체온 공급자는 구현되어 있지 않으므로 `body_temp`는 `null`이며, 혈압도 `null`로 보냅니다. 임의의 SpO2나 체온 값은 생성하지 않습니다.
 
 휴대폰 앱이 산행 시작 시 백엔드에 `hiking_records.status = 'active'` row를 먼저 만들고, 워치 앱은 `hiking_record_id` 없이 `user_id`만 전송합니다. 백엔드는 전달받은 `user_id`의 현재 active 산행을 찾아 `health_data_temp.hiking_record_id`에 자동 연결하는 구조를 전제로 합니다.
 
@@ -66,18 +66,26 @@ Health Services 에뮬레이터 synthetic data는 심박수와 걸음 관련 값
 
 버튼:
 
-- Start hiking: Health Services walking exercise 시작, 산행 상태 active 처리, 3초마다 백엔드 전송 시작
-- Stop hiking: exercise 종료, 3초 전송 중지
-- Measure SpO2: Galaxy Watch에서는 Samsung Health Sensor SDK로 실제 SpO2 1회 측정, fallback 상태에서는 fake SpO2를 한 단계 갱신
+- Start hiking: foreground service에 Health Services walking exercise와 3초 전송 시작 요청
+- Stop hiking: foreground service에 exercise 종료와 전송 중지 요청
+- Measure SpO2: Galaxy Watch에서 Samsung Health Sensor SDK로 실제 SpO2 1회 측정
 - Send once: 산행 active 상태에서 현재까지 모인 데이터를 1회 전송
 - Start & send next: exercise를 시작하고 다음 Health Services update가 들어오면 바로 전송
-- 3s backend send: ON/OFF 버튼. 산행 active 상태에서 3초마다 최신 통합 payload를 전송
+- 3s backend send: foreground service의 주기 전송 일시정지/재개
 
-Compose 대시보드의 두 번째 화면에서도 `시작` 버튼을 누르면 같은 `user_id`와 백엔드 설정으로 산행 전송이 시작됩니다. 시작 후에는 버튼이 `정지` 상태로 바뀌고, 누르면 Health Services exercise와 3초 백엔드 전송을 중지합니다.
+Compose 대시보드의 두 번째 화면에서 `시작`을 누르면 health foreground service가 산행 기록과 3초 주기 전송을 시작합니다. Activity가 화면에서 사라져도 서비스가 센서·전송 생명주기를 유지하며, 일시정지/재개/중단 명령만 Activity에서 전달합니다.
 
-처음 시작할 때 `ACTIVITY_RECOGNITION`, `BODY_SENSORS`, `READ_HEART_RATE` 또는 `READ_OXYGEN_SATURATION` 권한 요청이 뜰 수 있습니다. 허용해야 Health Services와 Samsung SpO2 데이터를 받을 수 있습니다.
+처음 시작할 때 건강 권한(`ACTIVITY_RECOGNITION`, 기기 버전에 따른 `BODY_SENSORS` 또는 health read 권한)을 먼저 요청합니다. 위치 권한과 알림 권한은 별도 요청으로 분리되어 있으며, 위치를 거부해도 건강 기록은 시작되고 SOS에는 기본 위치가 사용됩니다.
 
 백엔드 전송 시 `measured_at`은 KST(`Asia/Seoul`, `+09:00`) 오프셋이 포함된 ISO 문자열로 전송됩니다. `steps`와 `calories`는 Health Services walking exercise 시작 이후의 누적값으로 보냅니다.
+
+## 이상징후 및 긴급 신고 보호 장치
+
+- `/health/data/latest` 데이터는 현재 사용자와 일치하고 측정 시각이 존재해야 합니다.
+- 측정 후 90초가 지난 데이터와 현재보다 30초 이상 미래인 데이터는 이상징후 판정에서 제외합니다.
+- 레코드 id 또는 측정값 지문이 같은 데이터는 한 번만 처리합니다.
+- 같은 종류의 이상징후는 정상값이 다시 관측되기 전까지 하나의 에피소드로 취급해 중복 신고하지 않습니다.
+- 긴급 신고는 `대기 → 30초 카운트다운 → 전송 중 → 성공/실패` 상태로 관리합니다. 실패 시 재시도하거나 닫을 수 있으며, 자동 신고도 전송 결과를 화면에 표시합니다.
 
 ## Galaxy Watch 실제 SpO2 설정
 
@@ -96,7 +104,7 @@ app/libs/samsung-health-sensor-api.aar
 
 Samsung SpO2는 on-demand 측정이라 계속 흐르는 값이 아니라 1회 측정값입니다. 측정 중에는 워치를 손목에 밀착하고 팔을 움직이지 않아야 합니다. 완료되면 화면의 `SpO2 source`가 `Samsung Health Sensor SDK`로 표시되고, `spo2` 값이 백엔드 전송 payload에 들어갑니다.
 
-Samsung Health Sensor SDK는 에뮬레이터를 지원하지 않습니다. 에뮬레이터이거나 AAR 파일이 없거나 Health Platform 연결/권한/측정이 실패하면 앱은 자동으로 fake fallback을 사용합니다.
+Samsung Health Sensor SDK는 에뮬레이터를 지원하지 않습니다. 에뮬레이터이거나 AAR 파일이 없거나 Health Platform 연결/권한/측정이 실패하면 최근 15분 이내의 실측값만 재사용하고, 없으면 SpO2 없이 전송합니다.
 
 ## 에뮬레이터 synthetic data 테스트
 
@@ -133,27 +141,11 @@ Wear OS 3에서 실제 센서 provider로 되돌리려면:
 adb shell am broadcast -a "whs.USE_SENSOR_PROVIDERS" com.google.android.wearable.healthservices
 ```
 
-## JWT 토큰 설정
+## JWT 토큰 저장
 
-토큰은 두 가지 방식으로 넣을 수 있습니다.
+모바일 로그인 자격증명은 relay의 `/api/watch-credentials/latest`에서 받아 Android Keystore의 AES-GCM 키로 암호화한 뒤 SharedPreferences에 저장합니다. JWT를 `BuildConfig`나 저장소 파일에 넣지 않습니다. 이전 버전의 평문 preference가 있으면 최초 로드 시 암호화 형식으로 이전하고 기존 키를 삭제합니다.
 
-### 1. 앱 화면에서 직접 입력
-
-에뮬레이터에서 앱을 실행한 뒤 `JWT token` 입력란에 토큰을 붙여넣으면 됩니다. 이 값은 화면에서만 사용됩니다.
-
-### 2. local.properties로 BuildConfig 주입
-
-`local.properties.example`을 참고해서 프로젝트 루트에 `local.properties`를 만듭니다.
-
-```properties
-HEALTH_API_BASE_URL=https://web-production-94f63.up.railway.app
-HEALTH_API_TOKEN=your.jwt.token.here
-HEALTH_API_USER_ID=1
-```
-
-Gradle sync 또는 rebuild 후 앱을 실행하면 `BuildConfig.HEALTH_API_TOKEN`, `BuildConfig.HEALTH_API_USER_ID` 값이 화면 입력란의 기본값으로 들어갑니다.
-
-`local.properties`는 `.gitignore`에 포함되어 있으므로 실제 토큰을 커밋하지 않아도 됩니다.
+백엔드 테스트 화면은 JWT 원문을 입력받거나 노출하지 않고, 암호화 저장소에 자격증명이 있는지만 마스킹해서 표시합니다.
 
 ## 백엔드 주소 설정
 
@@ -177,10 +169,10 @@ Android/Wear OS 에뮬레이터에서 PC의 localhost로 접근할 때는 `local
 HEALTH_API_BASE_URL=http://10.0.2.2:8080
 ```
 
-물리 워치나 같은 Wi-Fi의 실제 기기에서 테스트한다면 PC의 LAN IP를 사용합니다.
+물리 워치나 같은 Wi-Fi의 실제 기기에서 테스트한다면 PC의 LAN IP를 사용하고, 그 개발 호스트만 `app/src/debug/res/xml/network_security_config.xml`에 추가합니다.
 
 ```properties
 HEALTH_API_BASE_URL=http://192.168.0.10:8080
 ```
 
-이 앱은 테스트 용도라 `AndroidManifest.xml`에 `usesCleartextTraffic="true"`를 켜두었습니다. 운영 앱에서는 HTTPS 사용을 권장합니다.
+release 빌드는 cleartext HTTP를 앱 설정과 repository 양쪽에서 거부합니다. debug 빌드도 기본적으로 HTTPS를 사용하며, 현재는 에뮬레이터 로컬 relay용 `10.0.2.2`와 `localhost`만 HTTP 예외로 허용합니다.
